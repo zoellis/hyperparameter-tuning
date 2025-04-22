@@ -1,0 +1,305 @@
+---
+title: "hyperparameter-tuning"
+format: html
+editor: visual
+---
+
+## LAB Setup, Data Import, and Tidy
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(powerjoin)
+library(skimr)
+library(visdat)
+library(ggpubr)
+library(janitor)
+library(rsample)
+library(recipes)
+library(dials)
+library(dplyr)
+library(ggplot2)
+library(viridis) 
+library(patchwork)
+
+
+
+file_paths <- list.files("data/", pattern = "*.txt", full.names = TRUE)
+data_list <- map(file_paths, ~ read_delim(.x, delim = ";"))
+data_list_filtered <- keep(data_list, ~ "gauge_id" %in% names(.x))
+camels_data <- reduce(data_list_filtered, ~ power_full_join(.x, .y, by = "gauge_id"))
+
+camels_clean <- camels_data %>%
+  janitor::clean_names() %>%         
+  drop_na(q_mean) %>%                
+  select(where(is.numeric))         
+
+missing_summary <- sapply(camels_clean, function(x) mean(is.na(x)))
+camels_clean <- camels_clean[, missing_summary < 0.3]
+
+camels_clean <- camels_clean %>%
+  drop_na()
+
+glimpse(camels_clean)
+
+
+training_data <- camels_clean
+
+data_recipe <- recipe(q_mean ~ ., data = training_data)
+
+expected_vars <- data_recipe$var_info %>%
+  filter(role == "predictor") %>%
+  pull(variable)
+
+actual_vars <- names(training_data)
+
+missing_vars <- setdiff(expected_vars, actual_vars)
+
+if (length(missing_vars) > 0) {
+  message("These variables are expected by the recipe but missing from the dataset:")
+  print(missing_vars)
+} else {
+  message("All predictor variables required by the recipe are present in the dataset.")
+}
+
+
+```
+
+```{r, message=FALSE, warning=FALSE, echo=TRUE, results='markup'}
+skim(camels_clean)
+```
+
+```{r}
+vis_miss(camels_clean)
+
+ggplot(camels_clean, aes(x = q_mean)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  labs(title = "Distribution of q_mean")
+```
+
+## Data Spliting
+
+```{r}
+
+set.seed(123)
+
+data_split <- initial_split(camels_clean, prop = 0.8)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+glimpse(train_data)
+glimpse(test_data)
+```
+
+## Feature Engineering
+
+```{r}
+data_recipe <- recipe(q_mean ~ ., data = train_data) %>%
+  step_rm(gauge_lat, gauge_lon) %>%
+  step_normalize(all_numeric(), -all_outcomes()) %>%  
+  step_dummy(all_nominal(), -all_outcomes())  
+
+data_recipe
+recipe_fitted <- prep(data_recipe, training = train_data)
+
+train_processed <- bake(recipe_fitted, new_data = train_data)
+
+test_processed <- bake(recipe_fitted, new_data = test_data)
+
+glimpse(train_processed)
+glimpse(test_processed) 
+
+```
+
+## Resampling and Model Testing
+
+```{r}
+set.seed(123)  
+cv_splits <- vfold_cv(train_data, v = 10)  
+
+
+linear_model <- linear_reg() %>%
+  set_engine("lm") %>%
+  set_mode("regression")
+
+
+rf_model <- rand_forest(mtry = 3, trees = 500, min_n = 5) %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+
+# Define a boosted tree model
+boosted_model <- boost_tree(mtry = 3, trees = 500, min_n = 5) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+linear_workflow <- workflow() %>%
+  add_recipe(data_recipe) %>%
+  add_model(linear_model)
+
+rf_workflow <- workflow() %>%
+  add_recipe(data_recipe) %>%
+  add_model(rf_model)
+
+boosted_workflow <- workflow() %>%
+  add_recipe(data_recipe) %>%
+  add_model(boosted_model)
+
+linear_results <- fit_resamples(linear_workflow, cv_splits)
+rf_results <- fit_resamples(rf_workflow, cv_splits)
+boosted_results <- fit_resamples(boosted_workflow, cv_splits)
+
+linear_metrics <- collect_metrics(linear_results)
+rf_metrics <- collect_metrics(rf_results)
+boosted_metrics <- collect_metrics(boosted_results)
+
+all_metrics <- bind_rows(
+  linear_metrics %>% mutate(model = "Linear Regression"),
+  rf_metrics %>% mutate(model = "Random Forest"),
+  boosted_metrics %>% mutate(model = "Boosted Trees")
+)
+
+all_metrics 
+
+```
+
+```{r}
+workflow_set <- workflow_set(
+  preproc = list(data_recipe),  
+  models = list(linear_model, rf_model, boosted_model),  
+  cross = TRUE  
+)
+results <- workflow_map(
+  workflow_set,  
+  resamples = cv_splits, 
+  metrics = metric_set(rmse, rsq), 
+  verbose = TRUE  
+)
+autoplot(results) 
+
+
+```
+
+#Given the Workflow Rank, Linear Regression is the best model. The rmse is the lowest of the 3 and the rsq is the highest.
+
+## Model Tuning
+
+```{r, eval=TRUE}
+
+1+1
+rf_tune_model <- rand_forest(
+  mtry = tune(),
+  min_n = tune(),
+  trees = 25
+) %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+
+rf_tune_workflow <- workflow() %>%
+  add_recipe(data_recipe) %>%
+  add_model(rf_tune_model) 
+
+set.seed(234)
+folds <- vfold_cv(training_data, v = 5)
+
+prep_recipe <- prep(data_recipe, training = training_data)
+baked_data <- bake(prep_recipe, new_data = NULL)
+n_predictors <- ncol(baked_data) - 1 
+
+dials <- extract_parameter_set_dials(rf_tune_workflow)
+dials <- update(dials, mtry = mtry(range = c(1, n_predictors)))
+
+final_dials <- finalize(dials, training_data)
+my.grid <- grid_space_filling(final_dials, size = 25)
+
+model_params <- tune_grid(
+  rf_tune_workflow,  
+  resamples = folds,
+  grid = my.grid,
+  metrics = metric_set(rmse, rsq, mae),
+  control = control_grid(save_pred = TRUE)
+) 
+autoplot(model_params) 
+```
+
+## Above is a visual of the selected predictors alongside the minimal node size. It looks like it ebs and flows as it progresses. The rsq also slowly decreases.
+
+```{r}
+
+collect_metrics(model_params) %>%
+  filter(.metric == "mae") %>%
+  arrange(mean)
+hp_best <- select_best(model_params, metric = "mae")
+hp_best
+
+final_rf_workflow <- finalize_workflow(
+  rf_tune_workflow,
+  hp_best
+)
+
+```
+
+# Final Model Verification
+
+```{r}
+final_fit <- last_fit(final_rf_workflow, split = data_split)
+collect_metrics(final_fit)
+
+final_predictions <- collect_predictions(final_fit)
+
+glimpse(final_predictions)  
+
+final_predictions <- collect_predictions(final_fit)
+
+glimpse(final_predictions)
+
+ggplot(final_predictions, aes(x = .pred, y = q_mean)) +
+  geom_point(aes(color = .pred), alpha = 0.7, size = 2) +
+  geom_smooth(method = "lm", se = FALSE, color = "purple", linetype = "dashed") +
+  geom_abline(intercept = 0, slope = 1, color = "green", linetype = "solid", linewidth = 1) +
+  scale_color_viridis_c(option = "C", direction = -1) +
+  labs(
+    title = "Predicted vs Actual Streamflow",
+    x = "Predicted Streamflow (log scale)",
+    y = "Actual Streamflow (log scale)",
+    color = "Predicted"
+  ) +
+  theme_minimal(base_size = 14)
+
+
+```
+
+## This model performs very well in displaying the actual vs. predicted streamlfow quantity.
+
+# Building A Map!
+
+```{r, fig.width=30, fig.height=15}
+
+final_model_fit <- fit(final_rf_workflow, data = camels_clean)
+
+full_predictions <- augment(final_model_fit, new_data = camels_clean) %>%
+  mutate(
+    lon = gauge_lon,         # rename for ggplot
+    lat = gauge_lat,
+    residual = (.pred - q_mean)^2
+  )
+
+map_preds <- ggplot(full_predictions, aes(x = lon, y = lat, color = .pred)) +
+  geom_point(size = 2, alpha = 0.8) +
+  scale_color_viridis_c(option = "C", name = "Predicted Q") +
+  coord_fixed(1.3) +
+  theme_minimal() +
+  labs(title = "Predicted Streamflow (Q)",
+       x = "Longitude", y = "Latitude")
+
+map_resid <- ggplot(full_predictions, aes(x = lon, y = lat, color = residual)) +
+  geom_point(size = 2, alpha = 0.8) +
+  scale_color_viridis_c(option = "A", name = "Residual (squared)") +
+  coord_fixed(1.3) +
+  theme_minimal() +
+  labs(title = "Residuals (Squared Errors)",
+       x = "Longitude", y = "Latitude")
+
+library(patchwork)
+map_preds + map_resid + plot_layout(ncol = 2)
+
+```
